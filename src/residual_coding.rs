@@ -357,11 +357,19 @@ fn decode_coeff_abs_level_remaining(cabac: &mut CabacReader, c_rice_param: u32) 
     }
 }
 
-/// Decode `nb` bypass-coded `coeff_sign_flag` bits.
-fn decode_coeff_sign_flag(cabac: &mut CabacReader, nb: u8) -> u32 {
+/// Decode `nb` bypass-coded `coeff_sign_flag` bits with optional stego slot recording.
+fn decode_coeff_sign_flags(
+    cabac: &mut CabacReader,
+    nb: u8,
+    qp: i32,
+    trafo_size: u8,
+    c_idx: u8,
+    coords: &[(u8, u8)],
+) -> u32 {
     let mut ret = 0u32;
-    for _ in 0..nb {
-        ret = (ret << 1) | cabac.decode_bypass();
+    for coord in coords.iter().take(nb as usize) {
+        let bit = cabac.decode_stego_sign(qp, trafo_size, c_idx, coord.0, coord.1);
+        ret = (ret << 1) | bit;
     }
     ret
 }
@@ -758,8 +766,26 @@ pub fn decode_residual_coding(
         // then spuriously flip later coefficients. Earlier fixtures hid
         // this pre-existing bug because they had few non-zero coefficients
         // per sub-block; the new signhide fixture forces the issue.
+        let mut coords = [(0u8, 0u8); 16];
+        for (m, &n_idx) in significant_coeff_flag_idx
+            .iter()
+            .take(n_end as usize)
+            .enumerate()
+        {
+            let n = n_idx as usize;
+            let x_c = (x_cg << 2) + scan_x_off[n] as usize;
+            let y_c = (y_cg << 2) + scan_y_off[n] as usize;
+            coords[m] = (x_c as u8, y_c as u8);
+        }
         let sign_nb = if sign_hidden { n_end - 1 } else { n_end };
-        let coeff_sign_flag = decode_coeff_sign_flag(cabac, sign_nb);
+        let coeff_sign_flag = decode_coeff_sign_flags(
+            cabac,
+            sign_nb,
+            qp + qp_bd_offset,
+            1 << log2_trafo_size,
+            c_idx as u8,
+            &coords[..sign_nb as usize],
+        );
         let mut sign_bits: u32 = (coeff_sign_flag << (16 - sign_nb)) & 0xffff;
 
         // Levels in reverse scan order, dequantize, and store.

@@ -279,6 +279,8 @@ pub struct Decoder {
     /// Phase 3d-2: RefPicList1 for the current B slice. Empty for P and I
     /// slices. Consumed by Phase 3d-5 AMVP.
     current_ref_list_l1: Vec<Rc<DecodedPicture>>,
+    /// Optional active steganography / CABAC observer.
+    pub active_observer: Option<*mut dyn crate::cabac::CabacObserver>,
 }
 
 /// Crop a decoded picture's planes to the conformance window and build a Frame.
@@ -350,6 +352,23 @@ fn crop_frame<P: Pixel>(
 impl Decoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Decode a NAL unit while recording CABAC bins through an observer.
+    pub fn decode_nal_with_observer(
+        &mut self,
+        nal: &NalUnit<'_>,
+        observer: &mut (dyn crate::cabac::CabacObserver + '_),
+    ) -> Result<Option<Frame>, DecodeError> {
+        self.active_observer = Some(unsafe {
+            core::mem::transmute::<
+                *mut (dyn crate::cabac::CabacObserver + '_),
+                *mut (dyn crate::cabac::CabacObserver + 'static),
+            >(observer as *mut _)
+        });
+        let res = self.decode_nal(nal);
+        self.active_observer = None;
+        res
     }
 
     /// Feed one NAL unit. Returns `Ok(Some(frame))` when a picture has just
@@ -586,6 +605,12 @@ impl Decoder {
         };
         let cabac_byte_offset = sh.header_size_bits / 8;
         let mut cabac = CabacReader::new(&nal.rbsp, cabac_byte_offset)?;
+        if let Some(obs) = self.active_observer {
+            unsafe {
+                cabac.attach_observer(&mut *obs, &contexts.state);
+                (*obs).start_substream(0, cabac_byte_offset, &contexts.state);
+            }
+        }
 
         // Spec 7.4.7.1: `entry_point_offset_minus1[i]` values are in NAL-unit
         // byte-space (they count the emulation-prevention bytes 0x03 present
@@ -804,6 +829,7 @@ impl Decoder {
             ),
             DecodeError,
         >;
+        let active_obs = self.active_observer;
         let ctb_loop_result: CtbLoopResult = with_picture_state!(&mut pic.state, |state| {
             let mut more_data = true;
             let mut ctb_addr_ts: u32 = slice_start_ts;
@@ -855,6 +881,15 @@ impl Decoder {
                         ));
                     }
                     state.first_qp_group = true;
+                    if let Some(obs) = active_obs {
+                        unsafe {
+                            (*obs).start_substream(
+                                substream_idx as usize,
+                                byte_offset,
+                                &contexts.state,
+                            );
+                        }
+                    }
                 }
 
                 let x_ctb = col * ctb_size;
@@ -901,6 +936,12 @@ impl Decoder {
         });
 
         let (final_ctb_addr_ts, final_saved_state, final_contexts_state) = ctb_loop_result?;
+
+        if let Some(obs) = self.active_observer {
+            unsafe {
+                (*obs).finish_slice(nal.rbsp.len());
+            }
+        }
 
         pic.ctbs_decoded = final_ctb_addr_ts;
         pic.saved_cabac_state = Some(final_contexts_state);

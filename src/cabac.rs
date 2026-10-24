@@ -34,6 +34,27 @@ fn lps_range_lookup(range: u32, state: u8) -> u32 {
     LPS_RANGE[2 * (range & 0xC0) as usize + state as usize] as u32
 }
 
+/// Observer callback for tracking CABAC bin decoding operations and steganography slots.
+pub trait CabacObserver {
+    /// Mark the beginning of a new substream within a slice.
+    fn start_substream(
+        &mut self,
+        substream_idx: usize,
+        rbsp_byte_start: usize,
+        init_contexts: &[u8; crate::cabac_tables::HEVC_CONTEXTS],
+    );
+    /// Mark the end of slice data.
+    fn finish_slice(&mut self, rbsp_len: usize);
+    /// Record a context-coded decision bin.
+    fn record_decision(&mut self, ctx_idx: usize, bit: u32);
+    /// Record an equiprobable bypass bin.
+    fn record_bypass(&mut self, bit: u32);
+    /// Record a bypass sign bit as a candidate stego slot.
+    fn record_stego_sign(&mut self, bit: u32, qp: i32, trafo_size: u8, c_idx: u8, x_c: u8, y_c: u8);
+    /// Record a terminate bin.
+    fn record_terminate(&mut self, bit: u32);
+}
+
 /// HEVC CABAC binary arithmetic decoder.
 ///
 /// Operates on the slice data RBSP **after** the slice header's byte
@@ -44,6 +65,10 @@ pub struct CabacReader<'a> {
     range: u32,
     data: &'a [u8],
     pos: usize,
+    /// Optional steganography/CABAC observer capturing the bin stream.
+    pub observer: Option<*mut (dyn CabacObserver + 'a)>,
+    /// Base memory address of the slice's context array.
+    pub ctx_base: usize,
 }
 
 impl<'a> CabacReader<'a> {
@@ -70,7 +95,45 @@ impl<'a> CabacReader<'a> {
             range: 0x1FE,
             data,
             pos: byte_offset + 2,
+            observer: None,
+            ctx_base: 0,
         })
+    }
+
+    /// Attach a steganography observer to record CABAC bins.
+    pub fn attach_observer(&mut self, obs: &mut (dyn CabacObserver + '_), contexts: &[u8]) {
+        self.observer = Some(unsafe {
+            core::mem::transmute::<*mut (dyn CabacObserver + '_), *mut (dyn CabacObserver + 'a)>(
+                obs as *mut _,
+            )
+        });
+        self.ctx_base = contexts.as_ptr() as usize;
+    }
+
+    #[inline]
+    pub fn decode_stego_sign(
+        &mut self,
+        qp: i32,
+        trafo_size: u8,
+        c_idx: u8,
+        x_c: u8,
+        y_c: u8,
+    ) -> u32 {
+        self.low = self.low.wrapping_add(self.low);
+        if self.low & CABAC_MASK == 0 {
+            self.refill();
+        }
+        let range = self.range << (CABAC_BITS + 1);
+        let bit = if self.low < range {
+            0
+        } else {
+            self.low = self.low.wrapping_sub(range);
+            1
+        };
+        if let Some(obs) = self.observer {
+            unsafe { (*obs).record_stego_sign(bit, qp, trafo_size, c_idx, x_c, y_c) };
+        }
+        bit
     }
 
     /// Refill the buffered region of `low` after a renormalization that
@@ -138,6 +201,17 @@ impl<'a> CabacReader<'a> {
         *state = MLPS_STATE[(128 + s_signed) as usize];
         let bit = (s_signed & 1) as u32;
 
+        if let Some(obs) = self.observer {
+            let ctx_idx = (state as *const u8 as usize).wrapping_sub(self.ctx_base);
+            debug_assert!(
+                ctx_idx < crate::cabac_tables::HEVC_CONTEXTS,
+                "CABAC context index {ctx_idx} is out of range (base {:#x}, state {:#x})",
+                self.ctx_base,
+                state as *const u8 as usize
+            );
+            unsafe { (*obs).record_decision(ctx_idx, bit) };
+        }
+
         // Renormalization (spec 9.3.4.3.5).
         let shift = norm_shift(self.range);
         self.range <<= shift;
@@ -156,12 +230,16 @@ impl<'a> CabacReader<'a> {
             self.refill();
         }
         let range = self.range << (CABAC_BITS + 1);
-        if self.low < range {
+        let bit = if self.low < range {
             0
         } else {
             self.low = self.low.wrapping_sub(range);
             1
+        };
+        if let Some(obs) = self.observer {
+            unsafe { (*obs).record_bypass(bit) };
         }
+        bit
     }
 
     /// Decode `n` bypass bins as an unsigned integer (MSB first).
@@ -177,7 +255,7 @@ impl<'a> CabacReader<'a> {
     /// Returns 1 if the slice is terminating, 0 otherwise.
     pub fn decode_terminate(&mut self) -> u32 {
         self.range -= 2;
-        if self.low < self.range << (CABAC_BITS + 1) {
+        let bit = if self.low < self.range << (CABAC_BITS + 1) {
             // Renormalize once
             let shift = (self.range.wrapping_sub(0x100)) >> 31;
             self.range <<= shift;
@@ -188,7 +266,11 @@ impl<'a> CabacReader<'a> {
             0
         } else {
             1
+        };
+        if let Some(obs) = self.observer {
+            unsafe { (*obs).record_terminate(bit) };
         }
+        bit
     }
 
     /// Current byte position in the RBSP (used for diagnostics).
