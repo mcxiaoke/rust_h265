@@ -54,18 +54,14 @@ mod inverse_transform;
 pub(crate) mod pixel;
 #[allow(dead_code)]
 mod pps;
-#[allow(dead_code)]
-mod profile_tier_level;
+pub mod profile_tier_level;
 #[allow(dead_code)]
 mod residual_coding;
 #[allow(dead_code)]
 mod sao;
-#[allow(dead_code)]
-mod scaling_list;
-#[allow(dead_code)]
+pub mod scaling_list;
 mod slice;
-#[allow(dead_code)]
-mod sps;
+pub mod sps;
 #[allow(dead_code)]
 mod vps;
 
@@ -85,6 +81,7 @@ pub use decoder::{Decoder, Frame};
 pub use error::DecodeError;
 pub use nal::{NalUnit, NalUnitType, parse_annex_b, parse_hvcc, parse_nal};
 pub use pixel::{Pixel, PixelData};
+pub use sps::{ShortTermRps, Sps, parse_sps};
 
 #[cfg(test)]
 mod parameter_set_tests {

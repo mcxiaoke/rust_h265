@@ -443,6 +443,11 @@ impl Decoder {
         None
     }
 
+    /// Returns a reference to the active Sequence Parameter Set (SPS), if parsed.
+    pub fn sps(&self) -> Option<&Sps> {
+        self.sps.as_ref()
+    }
+
     fn decode_slice(
         &mut self,
         nal: &NalUnit<'_>,
