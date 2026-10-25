@@ -791,6 +791,19 @@ pub fn decode_residual_coding(
         // Levels in reverse scan order, dequantize, and store.
         let mut c_rice_param = 0u32;
         let mut sum_abs: i64 = 0;
+        // Bit depth of this plane and the extra transform_skip rescale applied
+        // after the loop below. Hoisted so the magnitude reported for a sign
+        // slot matches the value that actually reaches the reconstruction.
+        let plane_bit_depth = if plane == ResidualPlane::Luma {
+            sps.bit_depth_luma
+        } else {
+            sps.bit_depth_chroma
+        };
+        let ts_shift: i32 = if transform_skip && !cu_transquant_bypass {
+            (15 - plane_bit_depth as i32 - log2_trafo_size as i32).max(0)
+        } else {
+            0
+        };
         for m in 0..n_end as usize {
             let n = significant_coeff_flag_idx[m] as usize;
             let x_c = (x_cg << 2) + scan_x_off[n] as usize;
@@ -831,8 +844,10 @@ pub fn decode_residual_coding(
             }
             sign_bits = (sign_bits << 1) & 0xffff;
 
+            let abs_dq: i32;
             if cu_transquant_bypass {
                 // No dequantization: raw coefficient levels are the spatial residual.
+                abs_dq = trans_coeff_level.unsigned_abs().min(i32::MAX as u64) as i32;
                 coeffs[y_c * trafo_size + x_c] = trans_coeff_level as i16;
             } else {
                 // Dequantize with scaling matrix lookup (HEVC spec 8.6.3).
@@ -855,7 +870,28 @@ pub fn decode_residual_coding(
                 };
                 let dq = (trans_coeff_level * scale as i64 * scale_m as i64 + add as i64) >> shift;
                 let dq = dq.clamp(-32768, 32767) as i16;
+                // Report the value the reconstruction actually sees: for
+                // transform_skip the loop-wide rescale below shrinks every
+                // coefficient by 2^ts_shift, so fold it in here instead of
+                // over-reporting the magnitude by that factor.
+                abs_dq = if ts_shift > 0 {
+                    ((dq as i32 + (1 << (ts_shift - 1))) >> ts_shift).unsigned_abs() as i32
+                } else {
+                    dq.unsigned_abs() as i32
+                };
                 coeffs[y_c * trafo_size + x_c] = dq;
+            }
+
+            // Sign data hiding hides the sign of the last coefficient visited by
+            // this loop, so only `0..sign_nb` has a recorded sign to pair with.
+            if m < sign_nb as usize {
+                cabac.record_stego_level(
+                    x_c as u8,
+                    y_c as u8,
+                    trans_coeff_level.unsigned_abs().min(u32::MAX as u64) as u32,
+                    abs_dq,
+                    plane_bit_depth,
+                );
             }
         }
     }

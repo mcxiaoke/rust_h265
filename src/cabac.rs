@@ -53,6 +53,26 @@ pub trait CabacObserver {
     fn record_stego_sign(&mut self, bit: u32, qp: i32, trafo_size: u8, c_idx: u8, x_c: u8, y_c: u8);
     /// Record a terminate bin.
     fn record_terminate(&mut self, bit: u32);
+
+    /// Back-fill the absolute coefficient level and the dequantized magnitude
+    /// for the coefficient whose sign was just recorded by `record_stego_sign`.
+    ///
+    /// Calls arrive in exactly the same order as `record_stego_sign` within one
+    /// coding group, including the DC `(0, 0)` coefficient.
+    ///
+    /// `abs_dq` is the dequantized value that reaches the inverse transform
+    /// (HEVC spec 8.6.3 `bdShift = bitDepth + log2(N) - 5` is already applied),
+    /// measured in samples of `bit_depth`. `abs_level` is the raw parsed level.
+    #[inline]
+    fn record_stego_level(
+        &mut self,
+        _x_c: u8,
+        _y_c: u8,
+        _abs_level: u32,
+        _abs_dq: i32,
+        _bit_depth: u8,
+    ) {
+    }
 }
 
 /// HEVC CABAC binary arithmetic decoder.
@@ -134,6 +154,24 @@ impl<'a> CabacReader<'a> {
             unsafe { (*obs).record_stego_sign(bit, qp, trafo_size, c_idx, x_c, y_c) };
         }
         bit
+    }
+
+    /// Back-fill the coefficient magnitude that belongs to a previously decoded
+    /// sign bit (used by steganography cost models).
+    #[inline]
+    pub fn record_stego_level(
+        &mut self,
+        x_c: u8,
+        y_c: u8,
+        abs_level: u32,
+        abs_dq: i32,
+        bit_depth: u8,
+    ) {
+        if let Some(obs) = self.observer {
+            // SAFETY: the observer outlives the whole `decode_nal_with_observer`
+            // call and is accessed from a single thread in decode order.
+            unsafe { (*obs).record_stego_level(x_c, y_c, abs_level, abs_dq, bit_depth) };
+        }
     }
 
     /// Refill the buffered region of `low` after a renormalization that
